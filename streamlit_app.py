@@ -17,11 +17,20 @@ import requests
 import pandas as pd
 import streamlit as st
 
-# Optional SmartAPI (read-only LTP)
+# Optional SmartAPI (read-only LTP) - robust import check
+SMARTAPI_AVAILABLE = False
+SmartConnect = None
 try:
-    from SmartApi.smartConnect import SmartConnect
+    import importlib.util
+    # check spec for the SmartApi.smartConnect module
+    spec = importlib.util.find_spec("SmartApi.smartConnect")
+    if spec is not None:
+        from SmartApi.smartConnect import SmartConnect
+        SMARTAPI_AVAILABLE = True
 except Exception:
     SmartConnect = None
+    SMARTAPI_AVAILABLE = False
+
 
 # ---------------- Page config ----------------
 APP_TITLE = "Shashidharan_Paper_Trade_API"
@@ -42,7 +51,7 @@ def sanitize_name(name):
 
 def current_user_id():
     """
-    Prefer SmartAPI clientcode from st.session_state['profile'] if present.
+    Prefer  clientcode from st.session_state['profile'] if present.
     Otherwise fallback to a stable sidebar text input 'paper_user'.
     """
     prof = st.session_state.get("profile", None)
@@ -391,7 +400,7 @@ def compute_positions_and_realized(df):
         pos_df = pd.DataFrame(columns=['symbol','netqty','avgcost','realized_for_symbol'])
     return pos_df, realized_per_symbol
 
-# ----------------- SmartAPI LTP helpers -----------------
+# -----------------  LTP helpers -----------------
 def fetch_ltp_for_ledger_rows(sc, ledger_df):
     if sc is None or ledger_df.empty:
         return [None] * len(ledger_df)
@@ -503,8 +512,8 @@ underlyings_all = available_underlyings(master)
 if not underlyings_all:
     st.warning("No underlyings found in master (check scrip master).")
 
-# ---------------- Sidebar: SmartAPI login (Code 2) ----------------
-st.sidebar.header("Optional SmartAPI (read-only LTP)")
+# ---------------- Sidebar:  login (Code 2) ----------------
+st.sidebar.header("Optional  (read-only LTP)")
 with st.sidebar.form("login_form", clear_on_submit=False):
     api_key = st.text_input("API Key", type="password", key="login_api_key")
     client_code = st.text_input("Client Code", key="login_client")
@@ -513,7 +522,7 @@ with st.sidebar.form("login_form", clear_on_submit=False):
     login_submit = st.form_submit_button("Login (read LTP)")
 
 if login_submit:
-    if SmartConnect is None:
+    if not SMARTAPI_AVAILABLE or SmartConnect is None:
         st.sidebar.error("smartapi-python not installed. Install to use SmartAPI LTP features.")
     else:
         try:
