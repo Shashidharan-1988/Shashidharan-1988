@@ -23,6 +23,38 @@ for _mod_path in (
         continue
 
 # If still None, leave SmartConnect as None. The UI will show a helpful message.
+# Put this right after your imports (and before most other module-level code)
+import traceback, sys
+
+def _show_startup_error(exc: Exception):
+    # Attempt to show error in the Streamlit UI. This is defensive:
+    try:
+        import streamlit as _st
+        # ensure page config exists so the UI renders
+        try:
+            _st.set_page_config(page_title="Startup error", layout="wide")
+        except Exception:
+            pass
+        _st.title("⚠️ App startup error")
+        _st.error("An exception occurred during app startup. Full traceback below:")
+        _st.code(traceback.format_exc(), language="py")
+    except Exception:
+        # fallback: print to stderr (visible in logs)
+        print("Startup exception:", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+
+# Wrap top-level execution so we can show the real error instead of Streamlit's redacted message
+try:
+    # --- BEGIN normal app code block ---
+    # (Place **all** of your existing top-level code below this try: OR simply
+    # wrap the remainder of the file content in the try: except that calls _show_startup_error.)
+    pass
+    # --- END normal app code block ---
+
+except Exception as e:
+    _show_startup_error(e)
+    # Re-raise so Cloud logs still capture it (optional)
+    raise
 
 
 # ---------------- Page config ----------------
