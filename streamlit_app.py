@@ -1,61 +1,27 @@
+# paper_trader_app.py
+"""
+Merged Paper-only Options/Derivatives Trading Simulator
+- Instrument selection & expiry parsing UI from expiry_underlying_app.py (Code 1)
+- Login + ledger + trade logic from paper_trader_app.py (Code 2)
+- Harmonized helpers for expiry parsing, strike parsing and instrument lookup
+- Simple ledger -> dataframe and FIFO-based position/realized calculation included
+"""
+
+import os
+import re
+import json
+from datetime import datetime, date
+from functools import lru_cache
+
+import requests
+import pandas as pd
+import streamlit as st
+
 # Optional SmartAPI (read-only LTP)
-# Try several known module paths so the app works regardless of which smartapi package is installed.
-SmartConnect = None
-_smartapi_import_error = None
-for _mod_path in (
-    "smartapi.smartConnect",       # some forks
-    "smartapi",                    # some packages expose smartapi module (may contain SmartConnect)
-    "SmartApi.smartConnect",       # older naming / capitalized package
-    "smartapi_python.smartConnect" # hypothetical
-):
-    try:
-        parts = _mod_path.split(".")
-        module = __import__(_mod_path, fromlist=['*'])
-        # common class name is SmartConnect (used by Angel One SmartAPI)
-        SmartConnect = getattr(module, "SmartConnect", None)
-        # Some packages expose SmartConnect with different capitalization - try alternatives
-        if SmartConnect is None:
-            SmartConnect = getattr(module, "smartConnect", None)
-        if SmartConnect is not None:
-            break
-    except Exception as e:
-        _smartapi_import_error = e
-        continue
-
-# If still None, leave SmartConnect as None. The UI will show a helpful message.
-# Put this right after your imports (and before most other module-level code)
-import traceback, sys
-
-def _show_startup_error(exc: Exception):
-    # Attempt to show error in the Streamlit UI. This is defensive:
-    try:
-        import streamlit as _st
-        # ensure page config exists so the UI renders
-        try:
-            _st.set_page_config(page_title="Startup error", layout="wide")
-        except Exception:
-            pass
-        _st.title("⚠️ App startup error")
-        _st.error("An exception occurred during app startup. Full traceback below:")
-        _st.code(traceback.format_exc(), language="py")
-    except Exception:
-        # fallback: print to stderr (visible in logs)
-        print("Startup exception:", file=sys.stderr)
-        traceback.print_exc(file=sys.stderr)
-
-# Wrap top-level execution so we can show the real error instead of Streamlit's redacted message
 try:
-    # --- BEGIN normal app code block ---
-    # (Place **all** of your existing top-level code below this try: OR simply
-    # wrap the remainder of the file content in the try: except that calls _show_startup_error.)
-    pass
-    # --- END normal app code block ---
-
-except Exception as e:
-    _show_startup_error(e)
-    # Re-raise so Cloud logs still capture it (optional)
-    raise
-
+    from SmartApi.smartConnect import SmartConnect
+except Exception:
+    SmartConnect = None
 
 # ---------------- Page config ----------------
 APP_TITLE = "Shashidharan_Paper_Trade_API"
@@ -718,153 +684,6 @@ with tabs[1]:
                         }
                         append_trade(trade)
                         st.success(f"Simulated trade saved: {side} {trade['symbol']} contracts {contracts_int} ({trade['qty']} units) @ {exec_price}")
-
-def auto_exit_by_sl_target(sc, ledger_df):
-    """
-    Check ledger for open positions with stop_loss/target set.
-    If current LTP hits stop_loss or target, append a simulated exit trade.
-    Conservative: only exits the open quantity (not partial unless lotsize causes remainder).
-    """
-    try:
-        if ledger_df is None or ledger_df.empty:
-            return
-
-        # Normalize ledger rows and find open positions
-        df = ledger_df.copy()
-        df['side'] = df['side'].astype(str).str.upper().fillna('BUY')
-        df['qty'] = pd.to_numeric(df.get('qty', 0), errors='coerce').fillna(0).astype(int)
-        # group to compute current net quantity per symbol
-        net_by_symbol = {}
-        meta_for_symbol = {}
-
-        for _, r in df.iterrows():
-            sym = r.get('symbol')
-            if not sym:
-                continue
-            side = (r.get('side') or 'BUY').upper()
-            qty = int(r.get('qty') or 0)
-            net_by_symbol[sym] = net_by_symbol.get(sym, 0) + (qty if side == 'BUY' else -qty)
-
-            # store latest token/lotsize/exch/underlying/expiry etc (used for exit)
-            meta_for_symbol[sym] = {
-                'token': r.get('token'),
-                'lotsize': int(r.get('lotsize', 1) or 1),
-                'exch_seg': r.get('exch_seg') or "NFO",
-                'underlying': r.get('underlying'),
-                'expiry': r.get('expiry'),
-                'strike': r.get('strike'),
-                'option_type': r.get('option_type')
-            }
-
-        # collect symbols which have stop/target defined on their open side orders
-        symbols_to_check = set()
-        # prefer last entry for each symbol where stop_loss/target were set
-        last_meta_with_sl_tgt = {}
-        for _, r in df.iterrows():
-            sym = r.get('symbol')
-            if not sym:
-                continue
-            sl = r.get('stop_loss')
-            tgt = r.get('target')
-            if sl or tgt:
-                last_meta_with_sl_tgt[sym] = {'stop_loss': sl, 'target': tgt}
-                symbols_to_check.add(sym)
-
-        if not symbols_to_check:
-            return
-
-        # fetch LTPs for these symbols (use existing helper which accepts sc and df)
-        symbols = list(symbols_to_check)
-        ltp_map = {}
-        if sc is not None:
-            try:
-                ltp_map = fetch_ltp_map_for_symbols(sc, df, symbols)
-            except Exception:
-                # fallback: set None for each
-                ltp_map = {s: None for s in symbols}
-        else:
-            ltp_map = {s: None for s in symbols}
-
-        # For each symbol with SL/TGT defined and with an open net position, check conditions
-        for sym in symbols:
-            net = net_by_symbol.get(sym, 0)
-            if net == 0:
-                continue  # nothing to exit
-            sltgt = last_meta_with_sl_tgt.get(sym, {})
-            if not sltgt:
-                continue
-            sl = sltgt.get('stop_loss')
-            tgt = sltgt.get('target')
-            current_ltp = ltp_map.get(sym)
-            if current_ltp is None:
-                continue
-            # decide whether SL or target hit depending on direction of position:
-            # for a long net (positive), stop_loss is price <= SL, target is price >= target
-            # for a short net (negative), stop_loss is price >= SL (stop for shorts), target is price <= target
-            hit = False
-            exit_type = None
-            if net > 0:
-                if sl is not None and float(current_ltp) <= float(sl):
-                    hit = True; exit_type = 'SL'
-                elif tgt is not None and float(current_ltp) >= float(tgt):
-                    hit = True; exit_type = 'TGT'
-            elif net < 0:
-                if sl is not None and float(current_ltp) >= float(sl):
-                    hit = True; exit_type = 'SL'
-                elif tgt is not None and float(current_ltp) <= float(tgt):
-                    hit = True; exit_type = 'TGT'
-
-            if not hit:
-                continue
-
-            # prepare exit trade: mirror your manual exit logic
-            meta = meta_for_symbol.get(sym, {})
-            token = meta.get('token')
-            lotsize = int(meta.get('lotsize') or 1)
-            exch_seg = meta.get('exch_seg') or "NFO"
-            side_exit = "SELL" if net > 0 else "BUY"
-            abs_netqty = abs(int(net))
-
-            # compute qty / contracts for exit (same remainder logic)
-            if lotsize > 1:
-                contracts_to_exit = abs_netqty // lotsize
-                remainder = abs_netqty % lotsize
-                if contracts_to_exit == 0:
-                    qty_exit = abs_netqty
-                    contracts_exit = 0
-                else:
-                    qty_exit = contracts_to_exit * lotsize
-                    contracts_exit = int(contracts_to_exit)
-                    # we intentionally leave remainder open (same as manual)
-            else:
-                qty_exit = abs_netqty
-                contracts_exit = int(qty_exit)
-
-            exit_trade = {
-                "timestamp": datetime.utcnow().isoformat(),
-                "symbol": sym,
-                "token": token,
-                "exch_seg": exch_seg,
-                "underlying": meta.get('underlying'),
-                "expiry": meta.get('expiry'),
-                "strike": meta.get('strike'),
-                "option_type": meta.get('option_type'),
-                "lotsize": lotsize,
-                "contracts": int(contracts_exit),
-                "qty": int(qty_exit),
-                "side": side_exit,
-                "price": float(current_ltp),
-                "note": f"auto_exit_{exit_type}"
-            }
-
-            # append trade (will be saved and cause a rerun next cycle)
-            append_trade(exit_trade)
-            # we append only one exit per run for safety; you may remove this break to auto-exit all
-            # break
-    except Exception:
-        # swallow any error — we don't want auto-exit to break the ledger UI
-        return
-
 
 
 # ---------- Paper Positions & Ledger ----------
