@@ -17,25 +17,30 @@ import requests
 import pandas as pd
 import streamlit as st
 
-# Optional SmartAPI (read-only LTP) - robust import check
-SMARTAPI_AVAILABLE = False
-SmartConnect = None
+# Optional SmartAPI (read-only LTP)
 try:
-    import importlib.util
-    # check spec for the SmartApi.smartConnect module
-    spec = importlib.util.find_spec("SmartApi.smartConnect")
-    if spec is not None:
-        from SmartApi.smartConnect import SmartConnect
-        SMARTAPI_AVAILABLE = True
+    from SmartApi.smartConnect import SmartConnect
 except Exception:
     SmartConnect = None
-    SMARTAPI_AVAILABLE = False
-
 
 # ---------------- Page config ----------------
-APP_TITLE = "Shashidharan_Paper_Trade_API"
+APP_TITLE = "Test_Paper_Trade_API"
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(f"📉 {APP_TITLE} (Paper-only)")
+
+# DEBUG: show sheet connectivity and row count for current user (temporary)
+if st.sidebar.button("DEBUG: Check Sheets"):
+    try:
+        # reuse helper from replacement block
+        sh, ws = _sheet_workbook_and_ws()
+        records = ws.get_all_records()
+        my_user = current_user_id()
+        my_rows = [r for r in records if str(r.get("user_id","")).strip() == str(my_user)]
+        st.sidebar.success(f"Connected. Sheet: {sh.title} — total rows: {len(records)} — your rows: {len(my_rows)}")
+    except Exception as e:
+        st.sidebar.error("Sheets debug error: " + str(e))
+
+
 
 # ---------------- Constants / files ----------------
 MASTER_FILENAME = "OpenAPIScripMaster.json"
@@ -51,7 +56,7 @@ def sanitize_name(name):
 
 def current_user_id():
     """
-    Prefer  clientcode from st.session_state['profile'] if present.
+    Prefer SmartAPI clientcode from st.session_state['profile'] if present.
     Otherwise fallback to a stable sidebar text input 'paper_user'.
     """
     prof = st.session_state.get("profile", None)
@@ -290,27 +295,176 @@ def find_instrument_row_by_expiry(master, expiry_date, underlying, strike, optio
         return r
     return None
 
-# ----------------- Ledger helpers -----------------
-def load_ledger():
-    fname = ledger_filename_for_user()
+# ----------------- Google Sheets backed ledger (drop-in replacement) -----------------
+
+# Local file fallback (keeps your existing behavior)
+LOCAL_LEDGER_DIR = "ledgers"
+os.makedirs(LOCAL_LEDGER_DIR, exist_ok=True)
+def _local_ledger_filepath():
+    fname = os.path.join(LOCAL_LEDGER_DIR, f"{safe_title}_{uid}_trades.json")
     if not os.path.exists(fname):
-        return []
+        with open(fname, "w") as f:
+            json.dump([], f)
+    return fname
+
+def _local_load_ledger():
+    f = _local_ledger_filepath()
     try:
-        with open(fname, "r") as f:
-            return json.load(f)
+        with open(f, "r") as fh:
+            return json.load(fh)
     except Exception:
         return []
 
+def _local_save_ledger(trades):
+    f = _local_ledger_filepath()
+    with open(f, "w") as fh:
+        json.dump(trades, fh, indent=2, default=str)
+    return True
+
+def _local_append_trade(trade):
+    trades = _local_load_ledger()
+    trades.append(trade)
+    return _local_save_ledger(trades)
+
+# Try to import Google Sheets libraries
+_use_gsheets = False
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+    _use_gsheets = True
+except Exception:
+    _use_gsheets = False
+
+# Helper: obtain gspread client from st.secrets (expects st.secrets["gcp_service_account"])
+def _get_gspread_client():
+    if not _use_gsheets:
+        raise RuntimeError("gspread/google-auth not available")
+    sa_info = st.secrets.get("gcp_service_account", None)
+    if sa_info is None:
+        raise RuntimeError("Google service account not found in st.secrets['gcp_service_account']")
+    if isinstance(sa_info, str):
+        sa_info = json.loads(sa_info)
+    creds = Credentials.from_service_account_info(sa_info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+    return gspread.authorize(creds)
+
+# Name of worksheet/tab to store trades
+_GSHEET_WORKSHEET = "trades"
+
+# Convert a ledger-trade dict to a row (ordered)
+_GS_HEADER = ["user_id","timestamp","symbol","token","exch_seg","underlying","expiry","strike","option_type",
+               "lotsize","contracts","qty","side","price","stop_loss","target","note"]
+
+def _sheet_workbook_and_ws():
+    """
+    Returns (sh, ws). May raise exceptions on failure.
+    """
+    gc = _get_gspread_client()
+    # sheet_id may be provided in two places for convenience
+    sheet_id = None
+    sa = st.secrets.get("gcp_service_account", {})
+    if isinstance(sa, dict):
+        sheet_id = sa.get("sheet_id")
+    if not sheet_id:
+        sheet_id = st.secrets.get("sheet_id")
+    if not sheet_id:
+        raise RuntimeError("Google Sheet ID not found in st.secrets (keys: gcp_service_account.sheet_id or sheet_id)")
+    sh = gc.open_by_key(sheet_id)
+    try:
+        ws = sh.worksheet(_GSHEET_WORKSHEET)
+    except gspread.exceptions.WorksheetNotFound:
+        # create worksheet with header row
+        ws = sh.add_worksheet(title=_GSHEET_WORKSHEET, rows="1000", cols=str(len(_GS_HEADER)))
+        ws.append_row(_GS_HEADER)
+    return sh, ws
+
+# --- Public API used in app (overrides local versions) ---
+
+def ledger_filename_for_user():
+    """
+    Kept for compatibility. With Sheets backend this returns a logical name.
+    """
+    # Keep same filename format but note: when using sheets this is not a file path.
+    return f"{safe_title}_{uid}_trades.json"
+
+def load_ledger():
+    """
+    Returns list-of-dicts trades for current user.
+    Tries Google Sheets first; falls back to local JSON file on any failure.
+    """
+    try:
+        sh, ws = _sheet_workbook_and_ws()
+        records = ws.get_all_records()  # returns list of dicts
+        my_user = current_user_id()
+        # filter for this user_id
+        my_rows = [r for r in records if str(r.get("user_id", "")).strip() == str(my_user)]
+        trades = []
+        for r in my_rows:
+            # convert row (dict) to trade dict shape (remove user_id)
+            trade = {k: (None if (v == "" or v is None) else v) for k, v in r.items() if k != "user_id"}
+            trades.append(trade)
+        return trades
+    except Exception as e:
+        # fallback to local file
+        return _local_load_ledger()
+
 def save_ledger(trades):
-    fname = ledger_filename_for_user()
-    with open(fname, "w") as f:
-        json.dump(trades, f, indent=2, default=str)
+    """
+    Overwrite this user's rows in the worksheet with `trades`.
+    Keeps other users' rows untouched. Falls back to local file on failure.
+    """
+    try:
+        sh, ws = _sheet_workbook_and_ws()
+        all_rows = ws.get_all_records()
+        my_user = current_user_id()
+        # keep other users
+        kept = [r for r in all_rows if str(r.get("user_id", "")).strip() != str(my_user)]
+        # convert trades into row dicts
+        new_rows = []
+        for t in trades:
+            row = {
+                "user_id": my_user,
+                "timestamp": t.get("timestamp"),
+                "symbol": t.get("symbol"),
+                "token": t.get("token"),
+                "exch_seg": t.get("exch_seg"),
+                "underlying": t.get("underlying"),
+                "expiry": t.get("expiry"),
+                "strike": t.get("strike"),
+                "option_type": t.get("option_type"),
+                "lotsize": t.get("lotsize"),
+                "contracts": t.get("contracts"),
+                "qty": t.get("qty"),
+                "side": t.get("side"),
+                "price": t.get("price"),
+                "stop_loss": t.get("stop_loss"),
+                "target": t.get("target"),
+                "note": t.get("note")
+            }
+            new_rows.append(row)
+        combined = kept + new_rows
+        # rewrite worksheet: clear, write header, append rows
+        ws.clear()
+        ws.append_row(_GS_HEADER)
+        if combined:
+            values = [[r.get(h, "") for h in _GS_HEADER] for r in combined]
+            ws.append_rows(values, value_input_option="USER_ENTERED")
+        return True
+    except Exception as e:
+        return _local_save_ledger(trades)
 
 def append_trade(trade):
-    fname = ledger_filename_for_user()
-    trades = load_ledger()
-    trades.append(trade)
-    save_ledger(trades)
+    """
+    Append a single trade for current user. Falls back to local JSON file on failure.
+    """
+    try:
+        sh, ws = _sheet_workbook_and_ws()
+        my_user = current_user_id()
+        row = [my_user] + [trade.get(k, "") for k in _GS_HEADER[1:]]
+        ws.append_row(row, value_input_option="USER_ENTERED")
+        return True
+    except Exception as e:
+        return _local_append_trade(trade)
+
 
 # ----------------- lightweight ledger -> df and P&L helpers -----------------
 def ledger_to_df(trades):
@@ -400,7 +554,7 @@ def compute_positions_and_realized(df):
         pos_df = pd.DataFrame(columns=['symbol','netqty','avgcost','realized_for_symbol'])
     return pos_df, realized_per_symbol
 
-# -----------------  LTP helpers -----------------
+# ----------------- SmartAPI LTP helpers -----------------
 def fetch_ltp_for_ledger_rows(sc, ledger_df):
     if sc is None or ledger_df.empty:
         return [None] * len(ledger_df)
@@ -512,8 +666,8 @@ underlyings_all = available_underlyings(master)
 if not underlyings_all:
     st.warning("No underlyings found in master (check scrip master).")
 
-# ---------------- Sidebar:  login (Code 2) ----------------
-st.sidebar.header("Optional  (read-only LTP)")
+# ---------------- Sidebar: SmartAPI login (Code 2) ----------------
+st.sidebar.header("Optional SmartAPI (read-only LTP)")
 with st.sidebar.form("login_form", clear_on_submit=False):
     api_key = st.text_input("API Key", type="password", key="login_api_key")
     client_code = st.text_input("Client Code", key="login_client")
@@ -522,7 +676,7 @@ with st.sidebar.form("login_form", clear_on_submit=False):
     login_submit = st.form_submit_button("Login (read LTP)")
 
 if login_submit:
-    if not SMARTAPI_AVAILABLE or SmartConnect is None:
+    if SmartConnect is None:
         st.sidebar.error("smartapi-python not installed. Install to use SmartAPI LTP features.")
     else:
         try:
