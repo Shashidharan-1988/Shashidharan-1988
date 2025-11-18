@@ -2,5 +2,6 @@ streamlit>=1.10
 pandas>=1.3
 requests>=2.25
 smartapi-python>=1.0.0
-websocket-client
-logzero
+gspread
+google-auth
+pandas
